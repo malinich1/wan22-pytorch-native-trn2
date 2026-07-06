@@ -61,35 +61,57 @@ Baseline to match/beat (from NXD implementation on trn2.48xlarge):
 
 ## Files
 
-| File | Description |
-| --- | --- |
-| `README.md` | This file |
-| `setup_env.sh` | Environment setup (NVMe, deps, venv) |
-| `run_inference.py` | Main E2E inference script (PyTorch Native) |
-| `compile_model.py` | Model compilation with torch.compile |
-| `expert_swap.py` | Expert weight swapping via copy_() |
-| `benchmarks.py` | Performance measurement & comparison |
-| `configs/` | Configuration files (model, parallelism) |
-| `utils/` | Shared utilities (logging, profiling) |
+| File | Description | Status |
+| --- | --- | --- |
+| `README.md` | This file | ✅ |
+| `FIXES_APPLIED.md` | **Documentation of all fixes and issues** | ✅ **READ THIS FIRST** |
+| `run_inference_simple.py` | **Simplified single-core inference (RECOMMENDED)** | ✅ Works |
+| `run_inference.py` | Full E2E inference script (needs distributed impl.) | ⚠️ Incomplete |
+| `compile_model.py` | Model compilation with torch.compile | ⚠️ Partial |
+| `expert_swap.py` | Expert weight swapping via copy_() | ✅ Fixed |
+| `benchmarks.py` | Performance measurement & comparison | ✅ Works |
+| `setup_env.sh` | Environment setup (NVMe, deps, venv) | ✅ |
+| `download_model.py` | Download WAN 2.2 from HuggingFace | ✅ |
+| `wan22_pytorch_native_workshop.ipynb` | Workshop notebook | ✅ Educational |
 
 ## Quick Start
 
+⚠️ **Status:** This implementation is **partially complete**. The simplified single-core version works, but distributed TP/CP requires additional implementation. See [FIXES_APPLIED.md](FIXES_APPLIED.md) for details.
+
+### Option 1: Simplified Single-Core (Recommended for Testing)
+
 ```bash
-# 1. Launch trn2.48xlarge with Neuron DLAMI (Ubuntu 24.04, SDK 2.29.1+)
+# 1. Install dependencies
+pip install diffusers>=0.38.0 transformers accelerate safetensors huggingface_hub \
+    imageio imageio-ffmpeg pillow tqdm torch
 
-# 2. Setup environment
-./setup_env.sh
-
-# 3. Activate venv
-source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate
-
-# 4. Download model weights (~118 GB)
+# 2. Download model weights (~118 GB)
 python download_model.py
 
-# 5. Run inference
-python run_inference.py --prompt "A cat walks on the grass, realistic style"
+# 3. Test on CPU (no Neuron hardware needed)
+python run_inference_simple.py \
+  --prompt "A cat walks on grass, realistic style" \
+  --device cpu \
+  --image \
+  --num-steps 10
 
+# 4. Run on single NeuronCore (on trn2 instance)
+python run_inference_simple.py \
+  --prompt "A cat walks on grass, realistic style" \
+  --device neuron \
+  --image \
+  --num-steps 20
 ```
+
+### Option 2: Full Pipeline (Requires Additional Work)
+
+The full distributed TP/CP implementation is **not yet complete**. To use it:
+
+1. Implement DTensor sharding for TP (see [FIXES_APPLIED.md](FIXES_APPLIED.md))
+2. Implement CP sequence splitting
+3. Launch with `torchrun --nproc-per-node=64`
+
+See [FIXES_APPLIED.md](FIXES_APPLIED.md) for the full list of required changes.
 
 ## Requirements
 

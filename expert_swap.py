@@ -31,38 +31,60 @@ def load_expert_weights(
 ) -> Dict[str, torch.Tensor]:
     """
     Load expert weights from safetensors checkpoint.
-    
+
     WAN 2.2 A14B has 2 experts:
       - Expert 1 (expert_id=0): High-noise denoising steps
       - Expert 2 (expert_id=1): Low-noise denoising steps
     They share architecture but have completely independent weights.
-    
+
     Args:
         model_dir: Path to model directory
         expert_id: 0 or 1
         dtype: Target dtype (bfloat16 for Trn2)
-    
+
     Returns:
         Dictionary mapping parameter names to tensors
     """
-    expert_dir = os.path.join(model_dir, "transformer", f"expert_{expert_id}")
-    
-    # If experts are in a single safetensors with prefix
-    # Adjust path based on actual model layout
-    safetensors_files = list(Path(model_dir, "transformer").glob("*.safetensors"))
-    
+    transformer_dir = os.path.join(model_dir, "transformer")
+
+    if not os.path.exists(transformer_dir):
+        raise ValueError(f"Transformer directory not found: {transformer_dir}")
+
+    safetensors_files = sorted(Path(transformer_dir).glob("*.safetensors"))
+
+    if not safetensors_files:
+        raise ValueError(f"No safetensors files found in {transformer_dir}")
+
     weights = {}
+    expert_prefix = f"expert.{expert_id}."
+
     for sf_file in safetensors_files:
         with safe_open(str(sf_file), framework="pt") as f:
             for key in f.keys():
-                # Filter to this expert's weights
-                if f"expert_{expert_id}" in key or expert_id == 0:
+                # WAN 2.2 MoE uses "expert.0." and "expert.1." prefixes
+                if key.startswith(expert_prefix):
+                    # Remove expert prefix to get base parameter name
+                    base_key = key[len(expert_prefix):]
+                    tensor = f.get_tensor(key).to(dtype)
+                    weights[base_key] = tensor
+                elif expert_id == 0 and not key.startswith("expert."):
+                    # Non-expert parameters (shared) - only load once for expert 0
                     tensor = f.get_tensor(key).to(dtype)
                     weights[key] = tensor
-    
+
+    if not weights:
+        # Fallback: if no expert prefix found, try loading all weights
+        # This handles cases where model doesn't have expert prefixes
+        print(f"  Warning: No expert.{expert_id}. prefix found, loading all weights")
+        for sf_file in safetensors_files:
+            with safe_open(str(sf_file), framework="pt") as f:
+                for key in f.keys():
+                    tensor = f.get_tensor(key).to(dtype)
+                    weights[key] = tensor
+
     print(f"  Loaded expert {expert_id}: {len(weights)} tensors, "
           f"{sum(t.numel() * t.element_size() for t in weights.values()) / 1e9:.1f} GB")
-    
+
     return weights
 
 

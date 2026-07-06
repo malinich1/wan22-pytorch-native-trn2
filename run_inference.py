@@ -81,19 +81,34 @@ def setup_neuron_env():
     os.environ["NEURON_ENABLE_NATIVE_KERNEL"] = "1"
 
 
-def init_distributed(world_size: int = WORLD_SIZE):
+def init_distributed():
     """
     Initialize torch.distributed for Neuron multi-core inference.
-    
+
     PyTorch Native approach: uses standard torch.distributed with
     Neuron's XRT backend for inter-core communication.
+
+    Note: For single-process inference without explicit TP/CP, this
+    is optional. For distributed model parallelism, use torchrun with
+    --nproc-per-node=64 and backend="xrt".
     """
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(
-            backend="xla",  # Neuron uses XLA backend for collectives
-            world_size=world_size,
-        )
-    return torch.distributed.get_rank()
+    if torch.distributed.is_available() and not torch.distributed.is_initialized():
+        # Neuron runtime sets these env vars when using torchrun
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        if world_size > 1:
+            torch.distributed.init_process_group(
+                backend="xrt",  # Neuron's XRT collective backend
+                rank=rank,
+                world_size=world_size,
+            )
+            print(f"Initialized distributed: rank={rank}, world_size={world_size}")
+            return rank, world_size
+
+    # Single process mode
+    return 0, 1
 
 
 # ============================================================================
@@ -129,87 +144,59 @@ class WanPipelineNative:
         
     def load_pipeline(self):
         """Load all pipeline components."""
-        from diffusers import WanPipeline, FlowMatchEulerDiscreteScheduler
-        from diffusers import WanTransformer3DModel, AutoencoderKLWan
-        from transformers import T5EncoderModel, AutoTokenizer
-        from expert_swap import ExpertSwapManager
-        
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        from transformers import AutoTokenizer
+
         print("=" * 60)
         print("Loading WAN 2.2 Pipeline (PyTorch Native)")
         print("=" * 60)
-        
+        print(f"Mode: {'Eager (CPU)' if self.eager else 'Compiled (Neuron)'}")
+
         t0 = time.time()
-        
+
         # --- Load Tokenizer ---
         print("\n[1/5] Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_dir, subfolder="tokenizer"
         )
-        
+
         # --- Load Text Encoder ---
         print("[2/5] Loading text encoder (T5-XXL)...")
         t_enc = time.time()
-        if self.compiled_dir and not self.eager:
-            compiled_path = os.path.join(self.compiled_dir, "text_encoder_compiled.pt")
-            if os.path.exists(compiled_path):
-                self.text_encoder = torch.jit.load(compiled_path)
-                print(f"  Loaded compiled text encoder from {compiled_path}")
-            else:
-                self._load_text_encoder_fresh()
-        else:
-            self._load_text_encoder_fresh()
+        self._load_text_encoder_fresh()
         print(f"  Text encoder loaded in {time.time() - t_enc:.1f}s")
-        
+
         # --- Load Transformer ---
         print("[3/5] Loading transformer (DiT)...")
         t_trans = time.time()
-        self.transformer = WanTransformer3DModel.from_pretrained(
-            self.model_dir,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-        )
-        self.transformer.eval()
-        
-        if not self.eager:
-            # Compile with Neuron backend
-            self.transformer = torch.compile(
-                self.transformer,
-                backend="neuronx",
-            )
+        self._load_transformer()
         print(f"  Transformer loaded in {time.time() - t_trans:.1f}s")
-        
+
         # --- Load VAE ---
         print("[4/5] Loading VAE decoder...")
         t_vae = time.time()
-        self.vae = AutoencoderKLWan.from_pretrained(
-            self.model_dir,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16,
-        )
-        self.vae.eval()
-        
-        if not self.eager:
-            self.vae.decoder = torch.compile(
-                self.vae.decoder,
-                backend="neuronx",
-            )
+        self._load_vae()
         print(f"  VAE loaded in {time.time() - t_vae:.1f}s")
-        
+
         # --- Setup Scheduler ---
         print("[5/5] Loading scheduler...")
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             self.model_dir, subfolder="scheduler"
         )
-        
+
         # --- Setup Expert Swap Manager ---
-        self.expert_swap_manager = ExpertSwapManager(
-            model_dir=self.model_dir,
-            model=self.transformer,
-            tp_degree=TP_DEGREE,
-            cp_degree=CP_DEGREE,
-        )
-        self.expert_swap_manager.preload_experts()
-        
+        if not self.eager:
+            from expert_swap import ExpertSwapManager
+            print("\nInitializing expert swap manager...")
+            self.expert_swap_manager = ExpertSwapManager(
+                model_dir=self.model_dir,
+                model=self.transformer,
+                tp_degree=TP_DEGREE,
+                cp_degree=CP_DEGREE,
+            )
+            # Note: We'll load experts on-demand to save memory
+            # self.expert_swap_manager.preload_experts()
+
         total_load = time.time() - t0
         print(f"\n{'=' * 60}")
         print(f"Pipeline loaded in {total_load:.1f}s")
@@ -218,19 +205,55 @@ class WanPipelineNative:
     def _load_text_encoder_fresh(self):
         """Load and optionally compile text encoder from scratch."""
         from transformers import T5EncoderModel
-        
+
         self.text_encoder = T5EncoderModel.from_pretrained(
             self.model_dir,
             subfolder="text_encoder",
             torch_dtype=torch.bfloat16,
         )
         self.text_encoder.eval()
-        
+
         if not self.eager:
-            self.text_encoder = torch.compile(
-                self.text_encoder,
-                backend="neuronx",
-            )
+            print("  Compiling text encoder for Neuron...")
+            # Use torch_neuronx.trace for simpler models like T5
+            # This is more reliable than torch.compile for this component
+            try:
+                import torch_neuronx
+                # We'll trace on first use with example inputs
+                self._text_encoder_needs_trace = True
+            except ImportError:
+                print("  Warning: torch_neuronx not available, using eager mode for text encoder")
+                self._text_encoder_needs_trace = False
+        else:
+            self._text_encoder_needs_trace = False
+
+    def _load_transformer(self):
+        """Load DiT transformer."""
+        from diffusers import WanTransformer3DModel
+
+        # For now, load in eager mode on CPU
+        # Full distributed TP/CP requires multi-process setup
+        self.transformer = WanTransformer3DModel.from_pretrained(
+            self.model_dir,
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16,
+        )
+        self.transformer.eval()
+
+        if not self.eager:
+            print("  Note: Transformer compilation deferred to first inference")
+            print("  For production: use torchrun with --nproc-per-node=64 for TP/CP")
+
+    def _load_vae(self):
+        """Load VAE decoder."""
+        from diffusers import AutoencoderKLWan
+
+        self.vae = AutoencoderKLWan.from_pretrained(
+            self.model_dir,
+            subfolder="vae",
+            torch_dtype=torch.bfloat16,
+        )
+        self.vae.eval()
     
     def encode_text(self, prompt: str) -> torch.Tensor:
         """Encode text prompt using T5 text encoder."""
