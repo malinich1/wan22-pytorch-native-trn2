@@ -117,7 +117,13 @@ def generate_image(
     gen_time = time.time() - gen_t0
 
     # Save
-    image = output.frames[0][0]  # First frame of first video
+    from PIL import Image as PILImage
+    import numpy as np
+    frame = output.frames[0][0]  # First frame of first video
+    if isinstance(frame, np.ndarray):
+        image = PILImage.fromarray(frame)
+    else:
+        image = frame
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     image.save(output_path)
 
