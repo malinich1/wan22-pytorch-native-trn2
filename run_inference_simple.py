@@ -121,6 +121,12 @@ def generate_image(
     import numpy as np
     frame = output.frames[0][0]  # First frame of first video
     if isinstance(frame, np.ndarray):
+        # Convert float [0,1] array to uint8 [0,255]
+        if frame.dtype != np.uint8:
+            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+        # Handle single-pixel height dimension (1, H, W, 3) -> (H, W, 3)
+        if frame.ndim == 4:
+            frame = frame.squeeze(0)
         image = PILImage.fromarray(frame)
     else:
         image = frame
