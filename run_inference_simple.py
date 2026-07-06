@@ -100,6 +100,7 @@ def generate_image(
         pipeline = pipeline.to(device)
 
     print(f"Pipeline loaded in {time.time() - load_t0:.1f}s")
+    load_time = time.time() - load_t0
 
     # Generate image
     print("\nGenerating image...")
@@ -139,7 +140,7 @@ def generate_image(
     print("✅ Image Generated")
     print("=" * 60)
     print(f"Output:     {output_path}")
-    print(f"Load time:  {load_t0:.1f}s")
+    print(f"Load time:  {load_time:.1f}s")
     print(f"Gen time:   {gen_time:.1f}s")
     print(f"Total time: {total_time:.1f}s")
     print("=" * 60)
