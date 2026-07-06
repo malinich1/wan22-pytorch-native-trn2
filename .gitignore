@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+
+# Neuron artifacts
+*.neff
+*_compile/
+compiler_cache/
+
+# Model weights (too large for git)
+models/
+*.safetensors
+*.bin
+
+# Outputs
+outputs/
+*.mp4
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

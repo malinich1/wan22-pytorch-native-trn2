@@ -1,0 +1,26 @@
+# WAN 2.2 T2V-A14B PyTorch Native on Trainium 2
+# Install in Neuron PyTorch venv (torch + torch-neuronx pre-installed)
+
+# Diffusion pipeline
+diffusers>=0.38.0
+transformers>=4.40.0
+accelerate>=0.30.0
+safetensors>=0.4.0
+
+# Model hub
+huggingface_hub>=0.23.0
+
+# Video output
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.0
+pillow>=10.0.0
+
+# Utilities
+tqdm>=4.66.0
+einops>=0.7.0
+
+# Neuron SDK (pre-installed in DLAMI venv, listed for reference)
+# torch>=2.9.0
+# torch-neuronx>=2.9.0
+# neuronx-cc>=2.24.0
+# neuronx-distributed>=0.10.0  # NOT used in this project (PyTorch Native approach)
