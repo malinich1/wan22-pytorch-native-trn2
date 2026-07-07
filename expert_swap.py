@@ -1,19 +1,30 @@
 """
-WAN 2.2 T2V-A14B — Expert Weight Swapping via tensor.copy_()
+WAN 2.2 T2V-A14B — Expert Weight Management
 
-PyTorch Native approach for swapping MoE expert weights in-place
-WITHOUT reinitializing the model or NEFF.
+WAN 2.2 Architecture:
+  Two INDEPENDENT transformer models (not shared weights):
+    - transformer/   (Expert 1): Handles high-noise denoising (t >= boundary)
+    - transformer_2/ (Expert 2): Handles low-noise denoising (t < boundary)
 
-Key insight: On Neuron, compiled NEFFs read weight tensors via DMA from
-the CPU tensor buffer. Using tensor.copy_() updates the buffer in-place,
-so the next forward pass reads the new weights automatically — no 
-recompilation or re-initialization needed.
+  boundary_ratio = 0.875 → Expert 1 runs for ~87.5% of timesteps
 
-Performance from NXD approach (target to match):
-- copy_() swap time: 64.1s across 64 ranks
-- ~1ms per tensor × ~64K tensors
+Approaches for Expert Handling:
+  1. Dual-model (recommended for trn2.48xlarge with 1.5TB HBM):
+     - Load BOTH transformers into memory
+     - Switch which model is called based on timestep
+     - No weight copying overhead, but 2x memory for transformers (~110GB)
+     - Used by run_inference.py (main pipeline)
 
-This module implements the same swap for PyTorch Native models.
+  2. Copy-swap (for memory-constrained setups):
+     - Load ONE transformer onto Neuron cores
+     - Use tensor.copy_() to swap weights when switching experts
+     - Key insight: On Neuron, compiled NEFFs read weight tensors via DMA
+       from CPU tensor buffer. copy_() updates buffer in-place — next
+       forward pass reads new weights without recompilation.
+     - Saves ~55GB HBM but adds swap latency (~60s for 14B model)
+
+This module implements the copy-swap approach for scenarios where both
+experts cannot fit simultaneously on the accelerator.
 """
 
 import os
@@ -32,20 +43,25 @@ def load_expert_weights(
     """
     Load expert weights from safetensors checkpoint.
 
-    WAN 2.2 A14B has 2 experts:
-      - Expert 1 (expert_id=0): High-noise denoising steps
-      - Expert 2 (expert_id=1): Low-noise denoising steps
-    They share architecture but have completely independent weights.
+    WAN 2.2 A14B has 2 experts stored as separate directories:
+      - Expert 0 (expert_id=0): transformer/   (high-noise denoising)
+      - Expert 1 (expert_id=1): transformer_2/ (low-noise denoising)
 
     Args:
-        model_dir: Path to model directory
+        model_dir: Path to model directory (parent of transformer/ and transformer_2/)
         expert_id: 0 or 1
         dtype: Target dtype (bfloat16 for Trn2)
 
     Returns:
         Dictionary mapping parameter names to tensors
     """
-    transformer_dir = os.path.join(model_dir, "transformer")
+    # WAN 2.2 stores experts as separate subdirectories
+    if expert_id == 0:
+        transformer_dir = os.path.join(model_dir, "transformer")
+    elif expert_id == 1:
+        transformer_dir = os.path.join(model_dir, "transformer_2")
+    else:
+        raise ValueError(f"Invalid expert_id: {expert_id}. Must be 0 or 1.")
 
     if not os.path.exists(transformer_dir):
         raise ValueError(f"Transformer directory not found: {transformer_dir}")
@@ -56,34 +72,15 @@ def load_expert_weights(
         raise ValueError(f"No safetensors files found in {transformer_dir}")
 
     weights = {}
-    expert_prefix = f"expert.{expert_id}."
-
     for sf_file in safetensors_files:
         with safe_open(str(sf_file), framework="pt") as f:
             for key in f.keys():
-                # WAN 2.2 MoE uses "expert.0." and "expert.1." prefixes
-                if key.startswith(expert_prefix):
-                    # Remove expert prefix to get base parameter name
-                    base_key = key[len(expert_prefix):]
-                    tensor = f.get_tensor(key).to(dtype)
-                    weights[base_key] = tensor
-                elif expert_id == 0 and not key.startswith("expert."):
-                    # Non-expert parameters (shared) - only load once for expert 0
-                    tensor = f.get_tensor(key).to(dtype)
-                    weights[key] = tensor
+                tensor = f.get_tensor(key).to(dtype)
+                weights[key] = tensor
 
-    if not weights:
-        # Fallback: if no expert prefix found, try loading all weights
-        # This handles cases where model doesn't have expert prefixes
-        print(f"  Warning: No expert.{expert_id}. prefix found, loading all weights")
-        for sf_file in safetensors_files:
-            with safe_open(str(sf_file), framework="pt") as f:
-                for key in f.keys():
-                    tensor = f.get_tensor(key).to(dtype)
-                    weights[key] = tensor
-
-    print(f"  Loaded expert {expert_id}: {len(weights)} tensors, "
-          f"{sum(t.numel() * t.element_size() for t in weights.values()) / 1e9:.1f} GB")
+    size_gb = sum(t.numel() * t.element_size() for t in weights.values()) / 1e9
+    print(f"  Loaded expert {expert_id} from {transformer_dir}: "
+          f"{len(weights)} tensors, {size_gb:.1f} GB")
 
     return weights
 
