@@ -194,8 +194,7 @@ class WanPipelineNative:
                 tp_degree=TP_DEGREE,
                 cp_degree=CP_DEGREE,
             )
-            # Note: We'll load experts on-demand to save memory
-            # self.expert_swap_manager.preload_experts()
+            self.expert_swap_manager.preload_experts()
 
         total_load = time.time() - t0
         print(f"\n{'=' * 60}")
@@ -305,38 +304,56 @@ class WanPipelineNative:
         
         total_denoise_t0 = time.time()
         
+        # If no expert swap manager (eager mode), run all steps without swapping
+        if self.expert_swap_manager is None:
+            print("  Running without expert swapping (eager mode)...")
+            for i, t in enumerate(timesteps):
+                latents = self._denoise_step(
+                    latents, text_embeddings, t, guidance_scale
+                )
+                if (i + 1) % 5 == 0 or (i + 1) == num_steps:
+                    print(f"    Step {i + 1}/{num_steps}")
+            total_denoise = time.time() - total_denoise_t0
+            print(f"\n  Total denoising: {total_denoise:.1f}s")
+            return latents
+        
+        # Calculate expert split (handle case where num_steps < EXPERT_1_STEPS)
+        expert1_steps = min(EXPERT_1_STEPS, num_steps)
+        expert2_steps = num_steps - expert1_steps
+        
         # --- Expert 1: High-noise steps ---
-        print(f"\n  Expert 1: steps 0-{EXPERT_1_STEPS - 1} (high noise)")
+        print(f"\n  Expert 1: steps 0-{expert1_steps - 1} (high noise)")
         expert1_t0 = time.time()
         swap_time_1 = self.expert_swap_manager.activate_expert(0)
         
-        for i, t in enumerate(timesteps[:EXPERT_1_STEPS]):
+        for i, t in enumerate(timesteps[:expert1_steps]):
             latents = self._denoise_step(
                 latents, text_embeddings, t, guidance_scale
             )
             if (i + 1) % 5 == 0:
-                print(f"    Step {i + 1}/{EXPERT_1_STEPS}")
+                print(f"    Step {i + 1}/{expert1_steps}")
         
         expert1_time = time.time() - expert1_t0
         print(f"  Expert 1 complete: {expert1_time:.1f}s "
               f"(swap: {swap_time_1:.1f}s, denoise: {expert1_time - swap_time_1:.1f}s)")
         
-        # --- Expert 2: Low-noise steps ---
-        expert2_steps = num_steps - EXPERT_1_STEPS
-        print(f"\n  Expert 2: steps {EXPERT_1_STEPS}-{num_steps - 1} (low noise)")
-        expert2_t0 = time.time()
-        swap_time_2 = self.expert_swap_manager.activate_expert(1)
-        
-        for i, t in enumerate(timesteps[EXPERT_1_STEPS:]):
-            latents = self._denoise_step(
-                latents, text_embeddings, t, guidance_scale
-            )
-            if (i + 1) % 5 == 0:
-                print(f"    Step {i + 1}/{expert2_steps}")
-        
-        expert2_time = time.time() - expert2_t0
-        print(f"  Expert 2 complete: {expert2_time:.1f}s "
-              f"(swap: {swap_time_2:.1f}s, denoise: {expert2_time - swap_time_2:.1f}s)")
+        # --- Expert 2: Low-noise steps (if any) ---
+        swap_time_2 = 0.0
+        if expert2_steps > 0:
+            print(f"\n  Expert 2: steps {expert1_steps}-{num_steps - 1} (low noise)")
+            expert2_t0 = time.time()
+            swap_time_2 = self.expert_swap_manager.activate_expert(1)
+            
+            for i, t in enumerate(timesteps[expert1_steps:]):
+                latents = self._denoise_step(
+                    latents, text_embeddings, t, guidance_scale
+                )
+                if (i + 1) % 5 == 0:
+                    print(f"    Step {i + 1}/{expert2_steps}")
+            
+            expert2_time = time.time() - expert2_t0
+            print(f"  Expert 2 complete: {expert2_time:.1f}s "
+                  f"(swap: {swap_time_2:.1f}s, denoise: {expert2_time - swap_time_2:.1f}s)")
         
         total_denoise = time.time() - total_denoise_t0
         print(f"\n  Total denoising: {total_denoise:.1f}s")
@@ -391,10 +408,12 @@ class WanPipelineNative:
         t0 = time.time()
         
         with torch.no_grad():
-            # Scale latents
-            latents = latents / self.vae.config.scaling_factor
+            # Normalize latents using mean/std from config
+            latents_mean = torch.tensor(self.vae.config.latents_mean, dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            latents_std = torch.tensor(self.vae.config.latents_std, dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            latents = latents * latents_std + latents_mean
             
-            # Decode (uses tiled decoding internally for memory efficiency)
+            # Decode
             video = self.vae.decode(latents).sample
         
         elapsed = time.time() - t0
@@ -470,25 +489,33 @@ class WanPipelineNative:
 # ============================================================================
 
 def save_video(video: torch.Tensor, output_path: str, fps: int = 16):
-    """Save video tensor to MP4 file."""
+    """Save video tensor to MP4 file or PNG if single frame."""
     import imageio
-    
-    print(f"Saving video to {output_path}...")
+    from PIL import Image
     
     # Convert from (1, C, T, H, W) to (T, H, W, C) uint8
-    video = video.squeeze(0)  # Remove batch
+    video = video.squeeze(0)  # Remove batch -> (C, T, H, W)
     video = video.permute(1, 2, 3, 0)  # C,T,H,W -> T,H,W,C
-    video = (video * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    video = (video.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
     
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
     
-    writer = imageio.get_writer(output_path, fps=fps, codec="libx264")
-    for frame in video:
-        writer.append_data(frame)
-    writer.close()
-    
-    file_size = os.path.getsize(output_path) / 1e6
-    print(f"  Saved: {output_path} ({file_size:.1f} MB, {len(video)} frames @ {fps} fps)")
+    if video.shape[0] == 1:
+        # Single frame — save as image
+        if not output_path.endswith(".png"):
+            output_path = output_path.rsplit(".", 1)[0] + ".png"
+        img = Image.fromarray(video[0])
+        img.save(output_path)
+        file_size = os.path.getsize(output_path) / 1024
+        print(f"  Saved image: {output_path} ({file_size:.1f} KB, {img.size})")
+    else:
+        # Multiple frames — save as video
+        writer = imageio.get_writer(output_path, fps=fps, codec="libx264")
+        for frame in video:
+            writer.append_data(frame)
+        writer.close()
+        file_size = os.path.getsize(output_path) / 1e6
+        print(f"  Saved: {output_path} ({file_size:.1f} MB, {len(video)} frames @ {fps} fps)")
 
 
 # ============================================================================
