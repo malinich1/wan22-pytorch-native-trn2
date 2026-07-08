@@ -52,7 +52,8 @@ instance with **AWS Native PyTorch Beta 3**.
 
 | File | Description |
 |---|---|
-| `run_inference.py` | **Main inference script** — full Beta 3 feature set |
+| `run_wan_small.py` | **WAN 1.3B inference** — Qwen2 pattern, tested & working |
+| `run_inference.py` | WAN 14B inference — full Beta 3 feature set (requires TP) |
 | `run_inference_simple.py` | Simplified entry point, defaults to eager mode |
 | `compile_model.py` | Pre-compile NEFFs and populate persistent cache |
 | `setup_env.sh` | Instance setup (NVMe, DLC pull, venv, env vars) |
@@ -144,14 +145,32 @@ export NEURON_COMPILE_CACHE_URL="file:///mnt/nvme/neff_cache"
 
 ---
 
-## Performance Targets (trn2.48xlarge)
+## Performance (Measured on trn2.48xlarge)
+
+### WAN 2.1 T2V-1.3B — Single NeuronCore (LNC2)
+
+| Metric | Eager on Neuron | torch.compile | Speedup |
+|---|---|---|---|
+| **Per-step time** | 26.14s | **0.82s** | **32x** |
+| Denoising (20 steps) | 522.8s | 87.9s | 6x |
+| Text encoding (UMT5, CPU) | 125.7s | 1.3s (cached) | 97x |
+| VAE decode (eager on Neuron) | 201.7s | 112.7s | 1.8x |
+| **Total end-to-end** | **850.3s (14.2 min)** | **201.9s (3.4 min)** | **4.2x** |
+
+Configuration: 384×640, 17 frames @ 16fps, 20 denoising steps, CFG=5.0  
+First-run NEFF compilation: ~71s (cached via `NEURON_COMPILE_CACHE_URL`)  
+Warm-cache total: ~130s (2.2 min)
+
+### WAN 2.2 T2V-A14B — Requires TP (future)
 
 | Metric | Cold cache (first run) | Warm cache |
 |---|---|---|
 | NEFF compilation | ~16 min (MoE) | ~3 min load |
-| Per denoising step (eager) | ~2.5s | ~2.5s |
 | Per denoising step (compiled) | ~0.8s | ~0.8s |
 | 40-step full inference | ~32s compiled | ~32s |
+
+> Note: The 14B MoE model requires tensor parallelism (TP=4+) to fit across
+> multiple NeuronCores. Use `run_inference.py` with `torchrun --nproc-per-node 4`.
 
 ---
 

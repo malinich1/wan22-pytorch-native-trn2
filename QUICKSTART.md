@@ -2,11 +2,27 @@
 
 **DLC:** `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`  
 **Instance:** `trn2.48xlarge` (64 NeuronCores, 1.5 TB NVMe)  
-**Last updated:** 2026-07-07
+**Last updated:** 2026-07-08
 
 ---
 
-## 30-Second Path (inside the DLC container)
+## Tested Performance (WAN 2.1 T2V-1.3B on trn2.48xlarge)
+
+| Metric | Eager (on Neuron) | torch.compile | Speedup |
+|---|---|---|---|
+| **Step time** | 26.14 s/step | **0.82 s/step** | **32x** |
+| Denoising (20 steps) | 522.8s | 87.9s (incl. compile) | 6x |
+| Text encoding (UMT5) | 125.7s | 1.3s (cached) | 97x |
+| VAE decode | 201.7s | 112.7s | 1.8x |
+| **Total inference** | **850.3s (14.2 min)** | **201.9s (3.4 min)** | **4.2x** |
+| Output | 384×640, 17 frames | 384×640, 17 frames | — |
+
+> Note: First compile run includes ~71s NEFF compilation (cached for subsequent runs).
+> With warm NEFF cache, total drops to ~130s (2.2 min).
+
+---
+
+## 30-Second Path (WAN 1.3B — recommended starting point)
 
 ```bash
 # 1. Pull & run the Beta 3 DLC
@@ -20,33 +36,35 @@ docker run -it --privileged -v /mnt/nvme:/mnt/nvme \
 
 # 2. Install diffusion deps (torch/neuronx already in DLC)
 pip install diffusers>=0.38.0 transformers>=4.44.0 accelerate \
-            safetensors imageio imageio-ffmpeg pillow
+            safetensors imageio imageio-ffmpeg pillow huggingface_hub
 
-# 3. Download model weights (~118 GB)
-python download_model.py
+# 3. Download WAN 1.3B model (~5 GB)
+python -c "from huggingface_hub import snapshot_download; \
+  snapshot_download('Wan-AI/Wan2.1-T2V-1.3B-Diffusers', \
+  local_dir='/mnt/nvme/models/Wan2.1-T2V-1.3B-Diffusers')"
 
-# 4. Smoke test — eager mode, single frame, 3 steps (~1 min)
-python run_inference.py \
-    --prompt "A cat walks on grass" \
-    --eager --height 256 --width 256 --num-frames 1 --num-inference-steps 3
+# 4. Run with torch.compile (production — 0.82s/step after NEFF compile):
+torchrun --nproc-per-node 1 /mnt/nvme/run_wan_small.py \
+    --model-id /mnt/nvme/models/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A graceful cat walks through a sunlit garden" \
+    --height 384 --width 640 --num-frames 17 --num-steps 20
 
-# 5. Production — torch.compile + persistent NEFF cache
-#    First run: ~16 min (cold NEFF compilation)
-#    Subsequent runs: ~3 min (warm cache load)
-python run_inference.py \
-    --prompt "A cat walks gracefully through a garden" \
-    --height 768 --width 1280 --num-inference-steps 40
+# 5. Or eager mode (instant start, no compilation — 26s/step):
+torchrun --nproc-per-node 1 /mnt/nvme/run_wan_small.py \
+    --model-id /mnt/nvme/models/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A graceful cat walks through a sunlit garden" \
+    --eager --height 384 --width 640 --num-frames 17 --num-steps 20
 ```
 
 ---
 
 ## Execution Modes
 
-| Mode | Flag | Startup | Throughput | Use case |
-|---|---|---|---|---|
-| Eager | `--eager` | Instant | ~2.5s/step | Debugging, validation |
-| Compile (cold) | _(default)_ | ~16 min | ~0.8s/step | First run on new instance |
-| Compile (warm) | _(default)_ | ~3 min | ~0.8s/step | Production (cached NEFFs) |
+| Mode | Flag | Startup | Step time | Total (20 steps, 17 frames) | Use case |
+|---|---|---|---|---|---|
+| Eager on Neuron | `--eager` | Instant | 26.14s | 14.2 min | Debugging, validation |
+| Compile (cold) | _(default)_ | ~71s NEFF | **0.82s** | 3.4 min | First run on new instance |
+| Compile (warm) | _(default)_ | ~0s | **0.82s** | ~2.2 min | Production (cached NEFFs) |
 
 ---
 

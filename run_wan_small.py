@@ -66,11 +66,7 @@ torch.set_default_dtype(torch.float32)
 
 def setup_neuron_env(neff_cache: str = DEFAULT_NEFF_CACHE):
     """Configure Beta 3 environment for single-device inference."""
-    os.environ["NEURON_CC_FLAGS"] = (
-        "-O1 --auto-cast=none --enable-native-kernel=1 "
-        "--remat --enable-ccop-compute-overlap"
-    )
-    os.environ["NEURON_ENABLE_NATIVE_KERNEL"] = "1"
+    os.environ["NEURON_CC_FLAGS"] = "-O1 --auto-cast=none"
     os.environ["TORCH_NEURONX_ENABLE_ASYNC_NRT"] = "1"
 
     # Persistent NEFF cache
@@ -175,11 +171,10 @@ def run_wan_inference(**kwargs):
         transformer.forward = torch.compile(
             transformer.forward, backend="neuron", fullgraph=True, dynamic=False
         )
-        logger.info(f"Rank {rank}: Compiling VAE decoder...")
-        vae.decode = torch.compile(
-            vae.decode, backend="neuron", fullgraph=True, dynamic=False
-        )
+        # Note: VAE decode uses tiled/loop-based decoding which isn't fullgraph-compatible.
+        # Keep VAE in eager mode on Neuron device — it's a single pass anyway.
         logger.info(f"Rank {rank}: Compilation registered (NEFFs built on first pass)")
+        logger.info(f"Rank {rank}: VAE stays in eager mode (tiled decode not fullgraph-compatible)")
     else:
         logger.info(f"Rank {rank}: Eager mode — skipping torch.compile")
 
