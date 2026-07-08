@@ -1,7 +1,6 @@
 # Code Review Summary: WAN 2.2 PyTorch Native on Trainium 2
 
 **Date:** 2026-07-06  
-**Reviewer:** Claude (Opus 4.8)  
 **Status:** ⚠️ **FIXED - Ready for Testing**
 
 ---
