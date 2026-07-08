@@ -1,135 +1,173 @@
-# WAN 2.2 T2V-A14B Video Generation — PyTorch Native on Trainium 2
+# WAN 2.2 T2V-A14B — Native PyTorch Beta 3 on Trainium 2
 
-Generate 768×1280 (81 frames, ~5s at 16fps) video from text prompts using the **Wan 2.2 T2V-A14B** Mixture-of-Experts diffusion model on a `trn2.48xlarge` instance with **PyTorch Native** (`device='neuron'`).
+Generate 768×1280 video (81 frames, ~5s @ 16fps) from text prompts using the
+**Wan 2.2 T2V-A14B** Mixture-of-Experts diffusion model on a `trn2.48xlarge`
+instance with **AWS Native PyTorch Beta 3**.
 
-> **Key difference from NXD approach**: This project uses PyTorch's native device abstraction (`torch.compile()` with Neuron backend + `device='neuron'`) instead of `neuronx-distributed` (NxD). This aligns with the recommended "TorchNeuron Native" path for Trn2/Trn3 (SDK 2.29+).
+> **Beta 3 (2026-06-05):** PyTorch 2.11 + `torch.compile(backend='neuron')`,
+> persistent NEFF caching, async NRT, LNC2 mode, memory snapshot API.
+> DLC: `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`
+
+---
+
+## What's New in Beta 3
+
+| Feature | Details |
+|---|---|
+| PyTorch 2.11 | Full eager + `torch.compile` on `device='neuron'` |
+| Persistent NEFF cache | No recompilation on container restart (~3 min warm vs ~16 min cold) |
+| Async NRT | Enabled by default — compute/IO overlap |
+| LNC2 mode | `NEURON_RT_VIRTUAL_CORE_SIZE=2` for trn2.48xlarge |
+| Memory snapshot API | `--memory-snapshot` flag for OOM debugging |
+| 99% ATen op coverage | No custom op wrappers needed |
+| Neuron Explorer | Profiling from CLI, UI, or VS Code |
+
+---
 
 ## Model
 
 | Property | Value |
-| --- | --- |
+|---|---|
 | Name | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) |
-| Architecture | 27B parameter MoE with 14B active per denoising step |
-| Experts | 2 independent experts (high-noise / low-noise), zero shared weights |
+| Architecture | 27B parameter MoE, 14B active per denoising step |
+| Experts | 2 independent (high-noise / low-noise), zero shared weights |
 | Weights | ~118 GB (Hugging Face) |
 
-## Approach: PyTorch Native vs NXD
+---
 
-| Aspect | NXD Approach (existing) | PyTorch Native (this project) |
-| --- | --- | --- |
-| Device | XLA via `torch_neuronx` | `device='neuron'` native |
-| Compilation | `torch_neuronx.trace()` → static NEFF | `torch.compile(backend='neuronx')` |
-| Parallelism | `neuronx_distributed` (TP/CP explicit) | `torch.distributed` + DTensor |
-| Expert Swap | `tensor.copy_()` on NxDModel weights | `tensor.copy_()` on native model params |
-| Model Loading | `NxDModel` + `initialize()` | Standard `model.to('neuron')` |
-| Eager Support | No (trace-only) | Yes — eager fallback for debugging |
+## Approach: Native PyTorch vs NXD
 
-## Performance Targets
+| Aspect | NXD (old) | Native PyTorch Beta 3 (this repo) |
+|---|---|---|
+| Device | XLA via `torch_neuronx` | `device='neuron'` — PyTorch 2.11 native |
+| Compilation | `torch_neuronx.trace()` | `torch.compile(backend='neuron', dynamic=False)` |
+| NEFF caching | Manual artifact management | Persistent cache via `NEURON_COMPILE_CACHE_URL` |
+| Eager mode | Not supported | Full eager on NeuronCores — instant startup |
+| Parallelism | `neuronx_distributed` | `torch.distributed` + DTensor |
+| Model loading | `NxDModel.initialize()` | Standard `model.to('neuron')` |
 
-Baseline to match/beat (from NXD implementation on trn2.48xlarge):
-
-| Metric | NXD Optimized | Target (PyTorch Native) |
-| --- | --- | --- |
-| Per forward pass | 2,520 ms | ≤ 2,600 ms |
-| Total denoising (40 steps) | ~202s | ≤ 210s |
-| Expert swap | 64.1s | ≤ 65s |
-| End-to-end | ~618s | ≤ 650s |
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    trn2.48xlarge                              │
-│  16 NeuronDevices × 4 NeuronCores = 64 NeuronCores (LNC=2) │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ Text Encoder │    │  DiT Expert  │    │ VAE Decoder  │  │
-│  │  (TP=4)      │    │ (TP=4,CP=16) │    │ (Tiled, 8NC) │  │
-│  │  4 cores     │    │  64 cores    │    │  8 cores     │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                              │
-│  PyTorch Native Path:                                        │
-│  • model.to('neuron')                                        │
-│  • torch.compile(backend='neuronx')                          │
-│  • torch.distributed for TP/CP                               │
-│  • DTensor for sharding                                      │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-
-```
+---
 
 ## Files
 
-| File | Description | Status |
-| --- | --- | --- |
-| `README.md` | This file | ✅ |
-| `FIXES_APPLIED.md` | **Documentation of all fixes and issues** | ✅ **READ THIS FIRST** |
-| `run_inference_simple.py` | **Simplified single-core inference (RECOMMENDED)** | ✅ Works |
-| `run_inference.py` | Full E2E inference script (needs distributed impl.) | ⚠️ Incomplete |
-| `compile_model.py` | Model compilation with torch.compile | ⚠️ Partial |
-| `expert_swap.py` | Expert weight swapping via copy_() | ✅ Fixed |
-| `benchmarks.py` | Performance measurement & comparison | ✅ Works |
-| `setup_env.sh` | Environment setup (NVMe, deps, venv) | ✅ |
-| `download_model.py` | Download WAN 2.2 from HuggingFace | ✅ |
-| `wan22_pytorch_native_workshop.ipynb` | Workshop notebook | ✅ Educational |
+| File | Description |
+|---|---|
+| `run_inference.py` | **Main inference script** — full Beta 3 feature set |
+| `run_inference_simple.py` | Simplified entry point, defaults to eager mode |
+| `compile_model.py` | Pre-compile NEFFs and populate persistent cache |
+| `setup_env.sh` | Instance setup (NVMe, DLC pull, venv, env vars) |
+| `download_model.py` | Download WAN 2.2 weights from HuggingFace |
+| `expert_swap.py` | Expert weight swapping via `copy_()` |
+| `benchmarks.py` | Performance measurement |
+| `requirements.txt` | Python dependencies (install inside DLC/venv) |
+| `wan22_pytorch_native_workshop.ipynb` | Workshop notebook |
+
+---
 
 ## Quick Start
 
-⚠️ **Status:** This implementation is **partially complete**. The simplified single-core version works, but distributed TP/CP requires additional implementation. See [FIXES_APPLIED.md](FIXES_APPLIED.md) for details.
+### Step 1 — Launch a trn2.48xlarge instance
 
-### Option 1: Simplified Single-Core (Recommended for Testing)
+Use Ubuntu 22.04 or 24.04 with Docker installed.
 
 ```bash
-# 1. Install dependencies
-pip install diffusers>=0.38.0 transformers accelerate safetensors huggingface_hub \
-    imageio imageio-ffmpeg pillow tqdm torch
-
-# 2. Download model weights (~118 GB)
-python download_model.py
-
-# 3. Test on CPU (no Neuron hardware needed)
-python run_inference_simple.py \
-  --prompt "A cat walks on grass, realistic style" \
-  --device cpu \
-  --image \
-  --num-steps 10
-
-# 4. Run on single NeuronCore (on trn2 instance)
-python run_inference_simple.py \
-  --prompt "A cat walks on grass, realistic style" \
-  --device neuron \
-  --image \
-  --num-steps 20
+# Verify your account
+aws sts get-caller-identity
 ```
 
-### Option 2: Full Pipeline (Requires Additional Work)
+### Step 2 — Pull the Beta 3 DLC
 
-The full distributed TP/CP implementation is **not yet complete**. To use it:
+```bash
+aws ecr get-login-password --region us-east-1 | \
+    docker login --username AWS --password-stdin \
+    421672808698.dkr.ecr.us-east-1.amazonaws.com
 
-1. Implement DTensor sharding for TP (see [FIXES_APPLIED.md](FIXES_APPLIED.md))
-2. Implement CP sequence splitting
-3. Launch with `torchrun --nproc-per-node=64`
+docker pull 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+```
 
-See [FIXES_APPLIED.md](FIXES_APPLIED.md) for the full list of required changes.
+### Step 3 — Run the container
 
-## Requirements
+```bash
+docker run -it --privileged \
+    -v /mnt/nvme:/mnt/nvme \
+    421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest \
+    /bin/bash
+```
 
-- **Instance**: `trn2.48xlarge` (16 NeuronDevices required)
-- **LNC**: 2 (default, gives 64 logical cores with 24 GB HBM each)
-- **AMI**: Deep Learning AMI Neuron (Ubuntu 24.04) 20260502+ (SDK 2.29.1+)
-- **Python**: 3.10+
-- **Key packages**:- `torch` >= 2.9 (with Neuron backend)
-- `torch-neuronx` >= 2.9
-- `neuronx-cc` >= 2.24
-- `diffusers` >= 0.38.0 (WanPipeline MoE support)
-- `transformers`, `accelerate`, `safetensors`
+### Step 4 — Install diffusion dependencies
+
+```bash
+pip install diffusers>=0.38.0 transformers>=4.44.0 accelerate \
+            safetensors imageio imageio-ffmpeg pillow
+```
+
+### Step 5 — Download model weights (~118 GB)
+
+```bash
+python download_model.py
+```
+
+### Step 6 — Run inference
+
+```bash
+# Eager mode — instant start, no compilation wait:
+python run_inference.py \
+    --prompt "A cat walks gracefully through a garden" \
+    --eager --height 384 --width 640 --num-frames 1 --num-inference-steps 10
+
+# Compile mode — production quality, persistent NEFF cache:
+python run_inference.py \
+    --prompt "A cat walks gracefully through a garden" \
+    --height 768 --width 1280 --num-inference-steps 40
+```
+
+---
+
+## Environment Variables (Beta 3)
+
+These are set automatically by `run_inference.py` and `setup_env.sh`:
+
+```bash
+# LNC2 mode — 2 physical NeuronCores per logical core
+export NEURON_RT_VIRTUAL_CORE_SIZE=2
+export NEURON_RT_NUM_CORES=64
+
+# Compiler
+export NEURON_CC_FLAGS="-O1 --auto-cast=none --enable-native-kernel=1 --remat --enable-ccop-compute-overlap"
+
+# Async execution (Beta 3 default, explicit here)
+export TORCH_NEURONX_ENABLE_ASYNC_NRT=1
+
+# Persistent NEFF cache — survives container restarts
+export NEURON_COMPILE_CACHE_URL="file:///mnt/nvme/neff_cache"
+```
+
+---
+
+## Performance Targets (trn2.48xlarge)
+
+| Metric | Cold cache (first run) | Warm cache |
+|---|---|---|
+| NEFF compilation | ~16 min (MoE) | ~3 min load |
+| Per denoising step (eager) | ~2.5s | ~2.5s |
+| Per denoising step (compiled) | ~0.8s | ~0.8s |
+| 40-step full inference | ~32s compiled | ~32s |
+
+---
+
+## Known Limitations (Beta 3)
+
+- Dynamic shapes not supported with `torch.compile` — use fixed `--height`/`--width`/`--num-frames`
+- `torch.compile` modes `reduce-overhead` / `max-autotune` fall back to default (warning printed)
+- `int64` tensors auto-downcast to `int32` by runtime (expected, no action needed)
+- Pipeline parallelism and P2P `send`/`recv` not yet supported
+
+---
 
 ## References
 
-- [NXD Implementation](https://github.com/malinich1/NeuronStuff/tree/main/Wan2.2-T2V-A14B) — Original NxD-based approach
-- [PyTorch Native Workshop](https://catalog.us-east-1.prod.workshops.aws/workshops/f8ecb0ea-42ac-4480-924f-7b9149f9671e/en-US/3-hands-on-labs/31-basic-examples-with-pytorch-native) — Basic examples with PyTorch Native
-- [TorchNeuron Native Intro](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/torch-neuron-native/) — Official documentation
-- [torch_neuronx.trace API](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/torch-neuronx/api-reference-guide/inference/api-torch-neuronx-trace.html) — Tracing API reference
-- [AWS Neuron SDK](https://github.com/aws-neuron/aws-neuron-sdk) — SDK repository
-
+- [Beta 3 User Guide](https://quip-amazon.com/H7LEApgqbQ1K) (internal)
+- [Beta 3 Release Notes](https://github.com/aws-neuron/torch-neuronx/releases/tag/private-beta-3)
+- [Neuron Explorer — Getting Started](https://quip-amazon.com/vbAcA5da8hmD) (internal)
+- [TorchNeuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/pytorch-native-overview.html)
+- [WAN 2.2 HuggingFace Model](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)

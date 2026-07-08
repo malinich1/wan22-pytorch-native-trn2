@@ -1,178 +1,142 @@
-# Quick Start Guide - WAN 2.2 PyTorch Native
+# Quick Start — WAN 2.2 Native PyTorch Beta 3
 
-**Status:** ✅ Fixed and ready for testing  
-**Last Updated:** 2026-07-06
+**DLC:** `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`  
+**Instance:** `trn2.48xlarge` (64 NeuronCores, 1.5 TB NVMe)  
+**Last updated:** 2026-07-07
 
 ---
 
-## 🚀 Fastest Way to Test
-
-### Option 1: Test on CPU (No Neuron Hardware Needed)
+## 30-Second Path (inside the DLC container)
 
 ```bash
-# 1. Install dependencies
-pip install torch diffusers>=0.38.0 transformers accelerate \
-    safetensors huggingface_hub imageio pillow
+# 1. Pull & run the Beta 3 DLC
+aws ecr get-login-password --region us-east-1 | \
+    docker login --username AWS --password-stdin \
+    421672808698.dkr.ecr.us-east-1.amazonaws.com
 
-# 2. Download model (~118 GB, requires HF account)
+docker run -it --privileged -v /mnt/nvme:/mnt/nvme \
+    421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest \
+    /bin/bash
+
+# 2. Install diffusion deps (torch/neuronx already in DLC)
+pip install diffusers>=0.38.0 transformers>=4.44.0 accelerate \
+            safetensors imageio imageio-ffmpeg pillow
+
+# 3. Download model weights (~118 GB)
 python download_model.py
 
-# 3. Quick test (2 minutes on modern CPU)
-python run_inference_simple.py \
-  --prompt "A beautiful sunset over mountains" \
-  --device cpu \
-  --image \
-  --num-steps 5 \
-  --height 256 \
-  --width 256
-```
+# 4. Smoke test — eager mode, single frame, 3 steps (~1 min)
+python run_inference.py \
+    --prompt "A cat walks on grass" \
+    --eager --height 256 --width 256 --num-frames 1 --num-inference-steps 3
 
-**Expected output:** `wan22_simple_YYYYMMDD_HHMMSS.png` in `/mnt/nvme/outputs/`
+# 5. Production — torch.compile + persistent NEFF cache
+#    First run: ~16 min (cold NEFF compilation)
+#    Subsequent runs: ~3 min (warm cache load)
+python run_inference.py \
+    --prompt "A cat walks gracefully through a garden" \
+    --height 768 --width 1280 --num-inference-steps 40
+```
 
 ---
 
-### Option 2: Test on Trainium 2 (Single Core)
+## Execution Modes
+
+| Mode | Flag | Startup | Throughput | Use case |
+|---|---|---|---|---|
+| Eager | `--eager` | Instant | ~2.5s/step | Debugging, validation |
+| Compile (cold) | _(default)_ | ~16 min | ~0.8s/step | First run on new instance |
+| Compile (warm) | _(default)_ | ~3 min | ~0.8s/step | Production (cached NEFFs) |
+
+---
+
+## Key Files
+
+| File | Purpose |
+|---|---|
+| `run_inference.py` | **Main script** — all Beta 3 features |
+| `run_inference_simple.py` | One-liner wrapper, defaults to eager |
+| `compile_model.py` | Pre-populate NEFF cache before first inference |
+| `setup_env.sh` | Full instance bootstrap (NVMe, DLC pull, env vars) |
+| `download_model.py` | Download WAN 2.2 weights from HuggingFace |
+
+---
+
+## All CLI Options
+
+```
+run_inference.py
+  --prompt               Text prompt (required)
+  --negative-prompt      Negative prompt for CFG
+  --model-dir            Model weights dir  [/mnt/nvme/models/Wan2.2-T2V-A14B-Diffusers]
+  --output               Output file path   [auto-generated]
+  --output-dir           Output directory   [/mnt/nvme/outputs]
+  --neff-cache           NEFF cache path    [/mnt/nvme/neff_cache]
+  --height               Frame height       [768]
+  --width                Frame width        [1280]
+  --num-frames           Frame count        [81]  (1 = image)
+  --num-inference-steps  Denoising steps    [40]
+  --guidance-scale       CFG scale          [5.0]
+  --seed                 Random seed        [42]
+  --fps                  Output video fps   [16]
+  --eager                Eager mode — no compilation, instant start
+  --memory-snapshot      Save Beta 3 memory snapshot (OOM debugging)
+```
+
+---
+
+## Beta 3 Environment Variables
+
+Set automatically by `run_inference.py`. Replicate manually if needed:
 
 ```bash
-# 1. Launch trn2.48xlarge instance
-# AMI: Deep Learning AMI Neuron (Ubuntu 24.04) 20260502+
-
-# 2. Setup environment
-./setup_env.sh
-source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate
-
-# 3. Download model
-python download_model.py
-
-# 4. Run single-core inference (10-20 min)
-python run_inference_simple.py \
-  --prompt "A cat walks gracefully through a garden" \
-  --device neuron \
-  --image \
-  --num-steps 10 \
-  --height 384 \
-  --width 640
+export NEURON_RT_VIRTUAL_CORE_SIZE=2          # LNC2 mode (trn2)
+export NEURON_RT_NUM_CORES=64
+export NEURON_CC_FLAGS="-O1 --auto-cast=none --enable-native-kernel=1 --remat --enable-ccop-compute-overlap"
+export TORCH_NEURONX_ENABLE_ASYNC_NRT=1       # Async NRT (default in Beta 3)
+export TORCH_NEURONX_ENABLE_HOST_CC=1         # Compute/comms overlap
+export NEURON_COMPILE_CACHE_URL="file:///mnt/nvme/neff_cache"  # Persistent NEFF cache
 ```
 
-**Expected output:** Image in ~10-20 minutes
+---
+
+## Troubleshooting
+
+**Model not found**
+```
+Error: Transformer directory not found at /mnt/nvme/models/...
+```
+Run `python download_model.py` first. Needs ~118 GB free on `/mnt/nvme`.
+
+**ECR 403 on docker pull**  
+Your AWS account needs to be allowlisted for the Beta 3 ECR repo
+(`421672808698`). Contact the Neuron team to add account access.
+
+**Slow first run (>16 min)**  
+Expected — cold NEFF compilation for MoE models. Subsequent runs use
+the persistent cache at `/mnt/nvme/neff_cache` and take ~3 min.
+
+**int32 downcast warnings**  
+Expected and harmless. Beta 3 auto-downcasts `int64` → `int32` on Neuron.
+
+**OOM on NeuronCore**  
+Add `--memory-snapshot` to capture a Beta 3 memory snapshot, then reduce
+resolution: `--height 384 --width 640 --num-frames 17`.
 
 ---
 
-## 📋 What Was Fixed
+## Verify NeuronCores
 
-The original code had **5 critical bugs**:
-
-1. ❌ Expert weight loading logic broken → ✅ Fixed
-2. ❌ Wrong distributed backend (xla vs xrt) → ✅ Fixed  
-3. ❌ Missing model loading methods → ✅ Fixed
-4. ❌ No device placement (`.to('neuron')`) → ✅ Fixed
-5. ❌ No TP/CP implementation → ⚠️ Deferred (single-core works)
-
-**See [REVIEW_SUMMARY.md](REVIEW_SUMMARY.md) for full details**
-
----
-
-## 📁 Key Files
-
-| File | Use This When... |
-|------|------------------|
-| `run_inference_simple.py` | 👈 **START HERE** - Testing, development, CPU |
-| `run_inference.py` | Production (needs distributed TP/CP impl.) |
-| `REVIEW_SUMMARY.md` | You want the executive summary |
-| `FIXES_APPLIED.md` | You need technical details of fixes |
-| `README.md` | Original documentation + status updates |
-
----
-
-## ⚡ Performance Guide
-
-| Configuration | Time for 40 Steps | Notes |
-|---------------|-------------------|-------|
-| CPU (test) | ~40 min | Good for validation |
-| Single Neuron | ~10-20 min | Functional but slow |
-| 64 Cores TP/CP | ~2-3 min ⚠️ | Not implemented yet |
-| NXD Baseline | ~3 min ✅ | Use this for production |
-
-**Recommendation:** Use simplified version for testing, NXD for production until distributed is implemented.
-
----
-
-## 🎯 Next Steps
-
-### For Testing (Now)
 ```bash
-# CPU quick test
-python run_inference_simple.py --prompt "test" --device cpu --image --num-steps 2 --height 128 --width 128
-
-# Single Neuron test
-python run_inference_simple.py --prompt "A cat" --device neuron --image --num-steps 10
+neuron-ls
+# Expected on trn2.48xlarge: 16 devices × 4 cores = 64 NeuronCores, 96 GB HBM each
 ```
-
-### For Development (Next)
-1. Read [FIXES_APPLIED.md](FIXES_APPLIED.md)
-2. Test with your prompts
-3. Profile memory usage
-4. Validate expert swapping
-
-### For Production (Future)
-1. Implement distributed TP/CP
-2. Add NEFF caching
-3. Integrate NKI Flash Attention
-4. Benchmark vs NXD baseline
-
-**Estimated time to production:** 3-5 weeks
 
 ---
 
-## 🐛 Troubleshooting
+## Resources
 
-### Model not found
-```
-Error: Transformer directory not found
-```
-**Solution:** Run `python download_model.py` first
-
-### Out of memory
-```
-RuntimeError: CUDA out of memory
-```
-**Solution:** Reduce resolution: `--height 256 --width 256 --num-frames 9`
-
-### Slow on CPU
-```
-Each step takes 60+ seconds
-```
-**Solution:** This is expected. Use `--num-steps 5` for testing or switch to Neuron
-
-### No Neuron device
-```
-Warning: Could not move to Neuron device
-```
-**Solution:** Either run on trn2 instance or use `--device cpu`
-
----
-
-## 📞 Getting Help
-
-1. **Quick questions:** Check [REVIEW_SUMMARY.md](REVIEW_SUMMARY.md)
-2. **Technical details:** See [FIXES_APPLIED.md](FIXES_APPLIED.md)
-3. **Original NXD approach:** [GitHub repo](https://github.com/malinich1/NeuronStuff/tree/main/Wan2.2-T2V-A14B)
-4. **PyTorch Native docs:** [AWS Neuron](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/torch-neuron-native/)
-
----
-
-## ✅ Success Checklist
-
-- [ ] Code reviewed and fixed
-- [ ] Dependencies installed
-- [ ] Model downloaded (~118 GB)
-- [ ] CPU test passes (2-5 min)
-- [ ] Single Neuron test passes (10-20 min)
-- [ ] Output images look correct
-- [ ] Ready for distributed implementation
-
-**You are here:** Steps 1-3 complete, ready for testing
-
----
-
-**Questions?** Start with the CPU test, then check the troubleshooting section above.
+- [Beta 3 User Guide](https://quip-amazon.com/H7LEApgqbQ1K) (internal)
+- [Neuron Explorer](https://quip-amazon.com/vbAcA5da8hmD) (internal)
+- [TorchNeuron Docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/pytorch-native-overview.html)
+- [Beta feedback survey](https://pulse.aws/survey/KHXDKDI4?p=0)

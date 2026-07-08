@@ -1,26 +1,37 @@
-# WAN 2.2 T2V-A14B PyTorch Native on Trainium 2
-# Install in Neuron PyTorch venv (torch + torch-neuronx pre-installed)
+# WAN 2.2 T2V-A14B — PyTorch Native Beta 3 on Trainium 2
+# -------------------------------------------------------
+# Run inside the Beta 3 DLC container or venv:
+#   421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+#
+# The DLC already ships:
+#   torch              2.11.0+cpu
+#   torch-neuronx      2.11.3.0.1254+1dc9304c.dev
+#   neuronx-cc         2.0.253257.0a0+fd6c623c
+#   nki                0.4.0b4
+#
+# Install only the diffusion / output dependencies below:
 
-# Diffusion pipeline
+# Diffusion pipeline (WanTransformer3DModel requires >= 0.38.0)
 diffusers>=0.38.0
-transformers>=4.40.0
+
+# Transformers — UMT5EncoderModel support
+transformers>=4.44.0
+
+# Acceleration utilities
 accelerate>=0.30.0
-safetensors>=0.4.0
+safetensors>=0.4.3
 
 # Model hub
-huggingface_hub>=0.23.0
+huggingface_hub>=0.24.0
 
 # Video output
 imageio>=2.34.0
 imageio-ffmpeg>=0.5.0
-pillow>=10.0.0
+pillow>=10.3.0
 
 # Utilities
 tqdm>=4.66.0
-einops>=0.7.0
+einops>=0.8.0
 
-# Neuron SDK (pre-installed in DLAMI venv, listed for reference)
-# torch>=2.9.0
-# torch-neuronx>=2.9.0
-# neuronx-cc>=2.24.0
-# neuronx-distributed>=0.10.0  # NOT used in this project (PyTorch Native approach)
+# NOTE: do NOT install neuronx-distributed — this project uses the
+# PyTorch Native path (device='neuron' + torch.compile), not NxD.
