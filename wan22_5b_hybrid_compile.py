@@ -1,6 +1,16 @@
 """
 WAN 2.2 TI2V-5B — Native PyTorch Inference on Neuron with torch.compile (Beta 3 DLC)
 
+⚠️  STATUS: torch.compile DOES NOT WORK for TI2V-5B (neuronx-cc exits with code 70).
+    The 5B model with 48 input channels exceeds the compiler's graph complexity limits.
+    Use the NxDModel approach instead (see: github.com/malinich1/NeuronStuff/Wan2.2-TI2V-5B/).
+
+    This script is kept as a reference for the native PyTorch pattern. For a working
+    5B inference on Neuron, use:
+      - Venv: /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference
+      - Approach: NxDModel (AOT compile with ModelBuilder, TP=4)
+      - Reference: https://github.com/whn09/aws-neuron-samples/tree/master/torch-neuronx/inference/hf_pretrained_wan2.2_ti2v
+
 Generates text-to-video (T2V) using the WAN 2.2 TI2V-5B (5B dense) model on
 Trainium 2 using the PyTorch Native approach:
   1. dist.init_process_group(backend="neuron")
